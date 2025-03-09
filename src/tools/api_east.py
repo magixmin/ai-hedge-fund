@@ -1,6 +1,9 @@
 import os
 import pandas as pd
 import requests
+import time
+import json
+from datetime import datetime
 
 from data.cache import get_cache
 from data.models import (
@@ -29,26 +32,88 @@ def get_prices(ticker: str, start_date: str, end_date: str) -> list[Price]:
         if filtered_data:
             return filtered_data
 
-    # If not in cache or no data in range, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
+    # 如果没有缓存或范围内没有数据，从新浪财经API获取
+    # 转换股票代码格式（添加市场前缀）
+    if ticker.startswith('6'):
+        formatted_ticker = f'sh{ticker}'
+    else:
+        formatted_ticker = f'sz{ticker}'
+    
+    # 转换日期格式
+    start_timestamp = int(time.mktime(datetime.strptime(start_date, "%Y-%m-%d").timetuple()))
+    end_timestamp = int(time.mktime(datetime.strptime(end_date, "%Y-%m-%d").timetuple()))
+    
+    # 新浪财经历史数据API
+    url = f"https://finance.sina.com.cn/realstock/company/{formatted_ticker}/hisdata.js?d={start_date}&end={end_date}"
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        # 解析响应数据
+        # 注意：实际实现需要根据新浪API的实际返回格式进行调整
+        data = response.json()
+        
+        prices = []
+        for item in data:
+            price = Price(
+                ticker=ticker,
+                time=item.get("date"),
+                open=float(item.get("open")),
+                high=float(item.get("high")),
+                low=float(item.get("low")),
+                close=float(item.get("close")),
+                volume=float(item.get("volume")),
+                adj_close=float(item.get("close")),  # 可能需要调整
+            )
+            prices.append(price)
+        
+        # 缓存结果
+        if prices:
+            _cache.set_prices(ticker, [p.model_dump() for p in prices])
+        
+        return prices
+    except Exception as e:
+        # 备选方案：使用东方财富数据
+        try:
+            # 东方财富API格式
+            if ticker.startswith('6'):
+                market_id = '1'  # 上证
+            else:
+                market_id = '0'  # 深证
+                
+            url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?secid={market_id}.{ticker}&fields=f1,f2,f3,f4,f5,f6,f7,f8&klt=101&fqt=0&beg={start_date.replace('-', '')}&end={end_date.replace('-', '')}"
+            response = requests.get(url)
+            response.raise_for_status()
+            
+            data = response.json()
+            klines = data.get('data', {}).get('klines', [])
+            
+            prices = []
+            for kline in klines:
+                parts = kline.split(',')
+                if len(parts) >= 7:
+                    price = Price(
+                        ticker=ticker,
+                        time=parts[0],
+                        open=float(parts[1]),
+                        close=float(parts[2]),
+                        high=float(parts[3]),
+                        low=float(parts[4]),
+                        volume=float(parts[5]),
+                        adj_close=float(parts[2]),  # 东方财富可能没有复权价
+                    )
+                    prices.append(price)
+            
+            # 缓存结果
+            if prices:
+                _cache.set_prices(ticker, [p.model_dump() for p in prices])
+            
+            return prices
+        except Exception as e:
+            raise Exception(f"获取价格数据失败: {ticker} - {str(e)}")
 
-    url = f"https://api.financialdatasets.ai/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-
-    # Parse response with Pydantic model
-    price_response = PriceResponse(**response.json())
-    prices = price_response.prices
-
-    if not prices:
-        return []
-
-    # Cache the results as dicts
-    _cache.set_prices(ticker, [p.model_dump() for p in prices])
-    return prices
+    return []
 
 
 def get_financial_metrics(
@@ -66,27 +131,39 @@ def get_financial_metrics(
         if filtered_data:
             return filtered_data[:limit]
 
-    # If not in cache or insufficient data, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
+    # 从东方财富获取财务指标
+    try:
+        # 东方财富财务指标API
+        url = f"http://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/ZYZBAjaxNew?type=0&code={ticker}"
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        data = response.json()
+        # 解析东方财富返回的财务数据
+        # 注意：实际实现需要根据东方财富API的实际返回格式进行调整
+        
+        financial_metrics = []
+        for item in data.get('data', [])[:limit]:
+            metrics = FinancialMetrics(
+                ticker=ticker,
+                report_period=item.get('REPORT_DATE'),
+                revenue=item.get('TOTAL_OPERATE_INCOME'),
+                net_income=item.get('PARENT_NETPROFIT'),
+                eps=item.get('BASIC_EPS'),
+                market_cap=None,  # 需要单独获取
+                # 其他财务指标...
+            )
+            financial_metrics.append(metrics)
+        
+        # 缓存结果
+        if financial_metrics:
+            _cache.set_financial_metrics(ticker, [m.model_dump() for m in financial_metrics])
+        
+        return financial_metrics
+    except Exception as e:
+        raise Exception(f"获取财务指标失败: {ticker} - {str(e)}")
 
-    url = f"https://api.financialdatasets.ai/financial-metrics/?ticker={ticker}&report_period_lte={end_date}&limit={limit}&period={period}"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-
-    # Parse response with Pydantic model
-    metrics_response = FinancialMetricsResponse(**response.json())
-    # Return the FinancialMetrics objects directly instead of converting to dict
-    financial_metrics = metrics_response.financial_metrics
-
-    if not financial_metrics:
-        return []
-
-    # Cache the results as dicts
-    _cache.set_financial_metrics(ticker, [m.model_dump() for m in financial_metrics])
-    return financial_metrics
+    return []
 
 
 def search_line_items(
@@ -256,12 +333,33 @@ def get_market_cap(
     end_date: str,
 ) -> float | None:
     """Fetch market cap from the API."""
-    financial_metrics = get_financial_metrics(ticker, end_date)
-    market_cap = financial_metrics[0].market_cap
-    if not market_cap:
-        return None
-
-    return market_cap
+    try:
+        # 从新浪或东方财富获取市值数据
+        if ticker.startswith('6'):
+            market_id = '1'  # 上证
+        else:
+            market_id = '0'  # 深证
+            
+        url = f"http://push2.eastmoney.com/api/qt/stock/get?secid={market_id}.{ticker}&fields=f57,f58,f116"
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        data = response.json()
+        # f116通常是总市值（单位：元）
+        market_cap = data.get('data', {}).get('f116')
+        
+        if market_cap:
+            # 转换为亿元
+            return float(market_cap) / 100000000
+        
+        # 如果上面的方法失败，尝试从财务指标中获取
+        financial_metrics = get_financial_metrics(ticker, end_date)
+        if financial_metrics and financial_metrics[0].market_cap:
+            return financial_metrics[0].market_cap
+    except Exception:
+        pass
+    
+    return None
 
 
 def prices_to_df(prices: list[Price]) -> pd.DataFrame:
